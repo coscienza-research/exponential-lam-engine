@@ -62,7 +62,7 @@ def gamma_eff(P, N: int, L: int) -> float:
     mu1_sq = mu1_signal(L) ** 2
     P = np.atleast_1d(np.asarray(P, dtype=np.float64))
     g = np.maximum(P - 1.0, 0.0) * K_L * np.exp(-N * sp["rho_L"]) / mu1_sq
-    return float(g) if g.size == 1 else g
+    return float(g.item()) if g.size == 1 else g
 
 
 def P_for_gamma(gamma: float, N: int, L: int, P_min: int = 2,
@@ -82,7 +82,7 @@ def m1_theory_gamma(gamma) -> float:
     """Asymptotic one-step overlap as a pure function of the reduced load."""
     g = np.maximum(np.atleast_1d(np.asarray(gamma, dtype=np.float64)), 1e-300)
     m = sp_erf(1.0 / np.sqrt(2.0 * g))
-    return float(m) if m.size == 1 else m
+    return float(m.item()) if m.size == 1 else m
 
 
 def N_for_log_capacity(L: int, log_P_target: float, N_min: int = 6) -> int:
@@ -205,7 +205,6 @@ def theory_m1_one_step(L, P, N, r=1.0, sigma2_per_pattern=None,
 
 
 def empirical_noise_std_mc(L, N, P, r=1.0, n_trials=30, seed=42) -> float:
-    rng_master = np.random.default_rng(seed)
     samples = []
     for trial in range(n_trials):
         rng_t = np.random.default_rng(seed + trial * 1000)

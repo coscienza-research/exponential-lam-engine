@@ -45,7 +45,6 @@ def to_xi_tensor(xi: np.ndarray, device: str = DEVICE):
 def one_step_parallel_batched(xi_t, sigma_t, site_chunk: int = _DEFAULT_CHUNK):
     """One synchronous parallel update of B states. Returns (B,L,N) float32 +-1."""
     P, L, N = xi_t.shape
-    B = sigma_t.shape[0]
     binomL2 = L * (L - 1) / 2.0
 
     # Full overlaps m[b,p,a] = <xi[p,a], sigma[b,a]> / N

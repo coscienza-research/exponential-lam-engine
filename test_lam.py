@@ -3,7 +3,6 @@ import pytest
 
 import lam_engine
 import lam_engine_torch
-from config import DEVICE
 
 
 def test_saddle_point():
