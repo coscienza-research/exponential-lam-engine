@@ -45,8 +45,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/andrea-ladiana/exponential-lam-engine"
-Repository = "https://github.com/andrea-ladiana/exponential-lam-engine"
+Homepage = "https://github.com/coscienza-research/exponential-lam-engine"
+Repository = "https://github.com/coscienza-research/exponential-lam-engine"
 arXiv = "https://arxiv.org/abs/2607.29554"
 DOI = "https://doi.org/10.48550/arXiv.2607.29554"
 
