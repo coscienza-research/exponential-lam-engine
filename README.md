@@ -28,7 +28,7 @@ This package contains the core engine and analytical theory aligned with Revisio
 
 1. **Reference NumPy Engine & Analytical Theory (`lam_engine.py`)**:
    - Exact zero-temperature cavity local-field dynamics (`mode="cavity"`) and exact single-flip energy gradient dynamics (`mode="exact"`), together with the exact pairwise exponential Hamiltonian (`hamiltonian_energy`).
-   - Asymptotic stability saddle-point solver (`saddle_point`) and corrected Laplace prefactor `K_L_prefactor` ($2/\sqrt{\det \mathcal{H}_L^*}$).
+   - Asymptotic stability saddle-point solver (`saddle_point`) and corrected Laplace prefactor `K_L_prefactor` ($2/\sqrt{\det \mathcal{H}_L^{\ast}}$).
    - **Proposition 1** non-asymptotic finite-$N$ moments (`mu1_signal_finiteN` / `s_N`, `log_v_N`), Cantelli stability bounds (`cantelli_flip_bound`, `cantelli_overlap_bound`), and counting error lower bound (`counting_flip_lower_bound`).
    - **Proposition 2** cue-driven retrieval theory (`rho_cue`, `log_s_cue`, `log_v_cue`, `gamma_cue`, `cue_envelope`).
    - Corrupted-basin saddle, annealed/typical/load-consistent thresholds (`corrupted_saddle`, `Sigma_L`, `C_L_prefactor`, `rc_annealed`, `rc_typical`, `rc_load`), and log-domain finite-$N$ typical-noise solvers (`log_noise_var_typ`, `basin_log`, `theory_basin_finiteN_typical`) avoiding double-precision underflow at large $N$.
@@ -43,7 +43,9 @@ This package contains the core engine and analytical theory aligned with Revisio
 
 The network comprises $L \ge 2$ layers of $N$ binary spins $\sigma^a \in \{-1, +1\}^N$ storing $P$ associated tuples $\{\xi^{\mu,a}\}_{\mu=1}^P \subset \{-1, +1\}^{L \times N}$. With per-layer Mattis overlaps $m_\mu^a = \frac{1}{N}\sum_{i=1}^N \xi_i^{\mu,a}\sigma_i^a$, the pairwise exponential energy is:
 
-$$\mathcal{H}(\sigma) = -N \sum_{\mu=1}^P \exp\!\left[ N \sum_{1 \le a < b \le L} \left(m_\mu^a m_\mu^b - 1\right) \right]$$
+$$
+\mathcal{H}(\sigma) = -N \sum_{\mu=1}^P \exp\left[ N \sum_{1 \le a < b \le L} \left(m_\mu^a m_\mu^b - 1\right) \right]
+$$
 
 At zero temperature, evaluating either the cavity local field or exact single-flip update across all $NL$ neurons costs $\Theta(NLP)$ in time and memory per sweep. Under cue retrieval, recall of a unique target pattern requires a single-valued association rule $\Psi$ (or a class-level majority readout when identical cues map to multiple stored patterns).
 
@@ -51,11 +53,15 @@ At zero temperature, evaluating either the cavity local field or exact single-fl
 
 Under i.i.d. Rademacher patterns, non-asymptotic exact signal and noise moments ($s_N, v_N$) together with Cantelli's one-sided inequality (without relying on a Gaussian noise approximation) and a combinatorial collision counting bound bracket the exponential storage capacity rate $\alpha_c = \frac{1}{N}\ln P_c$:
 
-$$\rho_L \le \alpha_c \le L \log 2, \qquad \rho_L \sim L \log 2 \text{ as } L \to \infty$$
+$$
+\rho_L \le \alpha_c \le L \log 2, \qquad \rho_L \sim L \log 2 \text{ as } L \to \infty
+$$
 
 A single stored configuration remains stable with high probability for $\alpha < \rho_L$, and all $P$ stored configurations are simultaneously stable for $\alpha < \rho_L / 2$. Asymptotically, the per-pattern noise second moment scales as $v_N \simeq K_L e^{-N\rho_L}$ with:
 
-$$K_L = \frac{2}{\sqrt{\det \mathcal{H}_L^*}}\,\sinh^2\!\big((L-1)m^*\big)\cosh\!\big(2(L-1)m^*\big)^{L-1}$$
+$$
+K_L = \frac{2}{\sqrt{\det \mathcal{H}_L^{\ast}}} \sinh^2\big((L-1)m^{\ast}\big) \cosh\big(2(L-1)m^{\ast}\big)^{L-1}
+$$
 
 giving $K_2 \approx 0.7216$, $K_3 \approx 0.9633$, $K_4 \approx 0.9950$, and $K_L \to 1$ as $L \to \infty$.
 
@@ -68,7 +74,7 @@ When $L-1$ layers are presented as a cue to infer the remaining target layer, di
 
 ### 4. Basins of Attraction & Sub-Capacity Typical Noise
 
-Tolerating initial overlap $r < 1$ reduces the capacity exponent—yielding annealed ($\varepsilon_L^{\text{ann}}(r) = \rho_L - 2\Sigma_L(r)$), typical ($\varepsilon_L^{\text{typ}}(r) = \rho_L - L(L-1)(1-r^2)$), and load-consistent ($L I_R(r_c) = \frac{1}{N}\ln P$) thresholds—while retaining exponential scaling inside the basin of attraction. At finite $N$ and sub-capacity loads ($P \ll e^{N L I_R(m^*)}$), realized noise fluctuations follow the typical-sample scale rather than the annealed rare-tail moment $v_N$; evaluating signal and noise in the log domain (`log_noise_var_typ`, `basin_log`) prevents float64 underflow (e.g., at $N=128, L=3$).
+Tolerating initial overlap $r < 1$ reduces the capacity exponent—yielding annealed ($\varepsilon_L^{\text{ann}}(r) = \rho_L - 2\Sigma_L(r)$), typical ($\varepsilon_L^{\text{typ}}(r) = \rho_L - L(L-1)(1-r^2)$), and load-consistent ($L I_R(r_c) = \frac{1}{N}\ln P$) thresholds—while retaining exponential scaling inside the basin of attraction. At finite $N$ and sub-capacity loads ($P \ll e^{N L I_R(m^{\ast})}$), realized noise fluctuations follow the typical-sample scale rather than the annealed rare-tail moment $v_N$; evaluating signal and noise in the log domain (`log_noise_var_typ`, `basin_log`) prevents float64 underflow (e.g., at $N=128, L=3$).
 
 ### 5. Structured Data Benchmarks
 
