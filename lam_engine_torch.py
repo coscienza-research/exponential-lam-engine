@@ -1,11 +1,12 @@
 """
 lam_engine_torch.py
-====================
+===================
 GPU-batched LAM dynamics (PyTorch) with a transparent NumPy fallback.
 
 Runs unmodified on CPU-only machines (the NumPy fallback path, `*_numpy` functions)
 and on a CUDA GPU when available.
 """
+
 from __future__ import annotations
 
 import logging
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import torch
+
     _HAS_TORCH = True
 except Exception:
     _HAS_TORCH = False
@@ -32,6 +34,14 @@ def torch_available() -> bool:
     return _HAS_TORCH
 
 
+def _resolve_torch_device(device: str) -> str | None:
+    if not _HAS_TORCH:
+        return None
+    if device == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    return "cpu" if device == "cuda" else device
+
+
 def to_xi_tensor(xi: np.ndarray, device: str = DEVICE):
     """Move a (P,L,N) int8 memory tensor to the device as float32 (+-1)."""
     if not _HAS_TORCH:
@@ -40,36 +50,58 @@ def to_xi_tensor(xi: np.ndarray, device: str = DEVICE):
 
 
 # ---------------------------------------------------------------------------
-# Batched one-step parallel dynamics (GPU)
+# Batched one-step parallel dynamics (GPU / CPU Torch)
 # ---------------------------------------------------------------------------
-def one_step_parallel_batched(xi_t, sigma_t, site_chunk: int = _DEFAULT_CHUNK):
-    """One synchronous parallel update of B states. Returns (B,L,N) float32 +-1."""
+def one_step_parallel_batched(
+    xi_t, sigma_t, site_chunk: int = _DEFAULT_CHUNK, mode: str = "cavity"
+):
+    """One synchronous parallel update of B states. Returns (B,L,N) float32 +-1.
+
+    mode="cavity": Eq. (local-field) cavity rule used throughout the paper.
+    mode="exact": exact single-flip energy gradient of the pairwise Hamiltonian.
+    """
+    if mode not in ("cavity", "exact"):
+        raise ValueError(f"Unknown mode {mode!r}; expected 'cavity' or 'exact'.")
+
     P, L, N = xi_t.shape
     binomL2 = L * (L - 1) / 2.0
 
     # Full overlaps m[b,p,a] = <xi[p,a], sigma[b,a]> / N
-    m = torch.einsum("pln,bln->bpl", xi_t, sigma_t) / N      # (B,P,L)
+    m = torch.einsum("pln,bln->bpl", xi_t, sigma_t) / N  # (B,P,L)
+    if mode == "exact":
+        rowsum_full = m.sum(dim=2, keepdim=True)  # (B,P,1)
+        G_full = rowsum_full - m  # (B,P,L)
+        E2_shifted = (
+            0.5 * N * (rowsum_full[:, :, 0] ** 2 - (m * m).sum(dim=2)) - N * binomL2
+        ).unsqueeze(-1)  # (B,P,1)
 
     new_sigma = torch.empty_like(sigma_t)
     for s in range(0, N, site_chunk):
         e = min(s + site_chunk, N)
-        xi_c = xi_t[:, :, s:e]                                # (P,L,C)
-        sig_c = sigma_t[:, :, s:e]                            # (B,L,C)
-        prod = xi_c.unsqueeze(0) * sig_c.unsqueeze(1)         # (B,P,L,C)
-        mhat = m.unsqueeze(-1) - prod / N                     # (B,P,L,C)
-        rowsum = mhat.sum(dim=2, keepdim=True)                # (B,P,1,C)
-        F = rowsum - mhat                                     # (B,P,L,C)
-        sum_m = rowsum[:, :, 0, :]                            # (B,P,C)
-        sum_m2 = (mhat * mhat).sum(dim=2)                     # (B,P,C)
-        Ehat = 0.5 * N * (sum_m ** 2 - sum_m2) - N * binomL2  # (B,P,C)
-        S = (prod * F).sum(dim=2)                             # (B,P,C)
+        xi_c = xi_t[:, :, s:e]  # (P,L,C)
+        sig_c = sigma_t[:, :, s:e]  # (B,L,C)
+        prod = xi_c.unsqueeze(0) * sig_c.unsqueeze(1)  # (B,P,L,C)
+
+        if mode == "cavity":
+            mhat = m.unsqueeze(-1) - prod / N  # (B,P,L,C)
+            rowsum = mhat.sum(dim=2, keepdim=True)  # (B,P,1,C)
+            F = rowsum - mhat  # (B,P,L,C)
+            sum_m = rowsum[:, :, 0, :]  # (B,P,C)
+            sum_m2 = (mhat * mhat).sum(dim=2)  # (B,P,C)
+            Ehat = 0.5 * N * (sum_m**2 - sum_m2) - N * binomL2  # (B,P,C)
+            S = (prod * F).sum(dim=2)  # (B,P,C)
+
         for a in range(L):
-            Fa = F[:, :, a, :]                                # (B,P,C)
-            prod_a = prod[:, :, a, :]                         # (B,P,C)
-            arg = Ehat + (S - prod_a * Fa)                    # (B,P,C)
-            mx = arg.amax(dim=1, keepdim=True)                # (B,1,C)
+            prod_a = prod[:, :, a, :]  # (B,P,C)
+            if mode == "cavity":
+                Fa = F[:, :, a, :]
+                arg = Ehat + (S - prod_a * Fa)
+            else:
+                Fa = G_full[:, :, a].unsqueeze(-1)
+                arg = E2_shifted - prod_a * Fa
+            mx = arg.amax(dim=1, keepdim=True)  # (B,1,C)
             w = torch.exp(arg - mx) * torch.sinh(xi_c[:, a, :].unsqueeze(0) * Fa)
-            Hs = w.sum(dim=1)                                 # (B,C)
+            Hs = w.sum(dim=1)  # (B,C)
             sgn = torch.sign(Hs)
             sgn[sgn == 0] = 1.0
             new_sigma[:, a, s:e] = sgn
@@ -86,20 +118,20 @@ def cue_seed_batched(xi_t, cue_t, known_layers):
     known = list(known_layers)
     unknown = [a for a in range(L) if a not in known]
 
-    m = torch.einsum("pln,bln->bpl", xi_t, cue_t) / N      # (B,P,L)
+    m = torch.einsum("pln,bln->bpl", xi_t, cue_t) / N  # (B,P,L)
     mask = torch.zeros(L, dtype=m.dtype, device=m.device)
     mask[known] = 1.0
-    m = m * mask.view(1, 1, L)                             # zero unknown overlaps
-    sum_m = m.sum(dim=2)                                   # (B,P)
+    m = m * mask.view(1, 1, L)  # zero unknown overlaps
+    sum_m = m.sum(dim=2)  # (B,P)
     sum_m2 = (m * m).sum(dim=2)
-    Ehat = 0.5 * N * (sum_m ** 2 - sum_m2) - N * binomL2   # (B,P)
-    F = m.sum(dim=2, keepdim=True) - m                     # (B,P,L)
-    mx = Ehat.amax(dim=1, keepdim=True)                    # (B,1)
-    w = torch.exp(Ehat - mx)                               # (B,P)
+    Ehat = 0.5 * N * (sum_m**2 - sum_m2) - N * binomL2  # (B,P)
+    F = m.sum(dim=2, keepdim=True) - m  # (B,P,L)
+    mx = Ehat.amax(dim=1, keepdim=True)  # (B,1)
+    w = torch.exp(Ehat - mx)  # (B,P)
 
     out = cue_t.clone()
     for a in unknown:
-        coeff = w * torch.sinh(F[:, :, a])                 # (B,P)
+        coeff = w * torch.sinh(F[:, :, a])  # (B,P)
         H = torch.einsum("bp,pn->bn", coeff, xi_t[:, a, :])  # (B,N)
         s = torch.sign(H)
         s = torch.where(s == 0, torch.ones_like(s), s)
@@ -120,7 +152,7 @@ def cue_seed_numpy(xi: np.ndarray, cue: np.ndarray, known_layers):
     m = m * mask.reshape(1, 1, L)
     sum_m = m.sum(2)
     sum_m2 = (m * m).sum(2)
-    Ehat = 0.5 * N * (sum_m ** 2 - sum_m2) - N * binomL2
+    Ehat = 0.5 * N * (sum_m**2 - sum_m2) - N * binomL2
     F = m.sum(2, keepdims=True) - m
     w = np.exp(Ehat - Ehat.max(axis=1, keepdims=True))
     out = cue.copy().astype(np.int8)
@@ -134,10 +166,16 @@ def cue_seed_numpy(xi: np.ndarray, cue: np.ndarray, known_layers):
 
 
 # ---------------------------------------------------------------------------
-# Iterated parallel dynamics (with cue clamping)
+# Iterated parallel dynamics & fixed-point relaxation (with cue clamping)
 # ---------------------------------------------------------------------------
-def iterate_parallel_batched(xi_t, sigma_t, n_steps: int, site_chunk: int = _DEFAULT_CHUNK,
-                             clamp_layers=None):
+def iterate_parallel_batched(
+    xi_t,
+    sigma_t,
+    n_steps: int,
+    site_chunk: int = _DEFAULT_CHUNK,
+    clamp_layers=None,
+    mode: str = "cavity",
+):
     """Apply n_steps batched parallel updates."""
     s = sigma_t
     cue = None
@@ -145,66 +183,172 @@ def iterate_parallel_batched(xi_t, sigma_t, n_steps: int, site_chunk: int = _DEF
         clamp_layers = list(clamp_layers)
         cue = sigma_t[:, clamp_layers, :].clone()
     for _ in range(n_steps):
-        s = one_step_parallel_batched(xi_t, s, site_chunk=site_chunk)
+        s = one_step_parallel_batched(xi_t, s, site_chunk=site_chunk, mode=mode)
         if clamp_layers:
             s[:, clamp_layers, :] = cue
     return s
 
 
+def relax_parallel_batched(
+    xi_t,
+    sigma_t,
+    max_steps: int = 20,
+    site_chunk: int = _DEFAULT_CHUNK,
+    clamp_layers=None,
+    mode: str = "cavity",
+):
+    """Iterate synchronous updates until fixed point or max_steps.
+
+    Returns (final_states, steps_used, converged_mask).
+    """
+    B = sigma_t.shape[0]
+    clamp = list(clamp_layers) if clamp_layers else None
+    cue = sigma_t[:, clamp, :].clone() if clamp else None
+    s = sigma_t.clone()
+    steps = torch.zeros(B, dtype=torch.int32, device=sigma_t.device)
+    done = torch.zeros(B, dtype=torch.bool, device=sigma_t.device)
+    for t in range(1, max_steps + 1):
+        act = (~done).nonzero(as_tuple=False).flatten()
+        if act.numel() == 0:
+            break
+        nxt = one_step_parallel_batched(xi_t, s[act], site_chunk=site_chunk, mode=mode)
+        if clamp:
+            nxt[:, clamp, :] = cue[act]
+        same = (nxt == s[act]).flatten(1).all(dim=1)
+        s[act] = nxt
+        steps[act[~same]] = t
+        done[act[same]] = True
+    return s, steps, done
+
+
 # ---------------------------------------------------------------------------
 # NumPy fallback (loops states through the reference field)
 # ---------------------------------------------------------------------------
-def iterate_parallel_batched_numpy(xi: np.ndarray, sigma_batch: np.ndarray,
-                                   n_steps: int, clamp_layers=None) -> np.ndarray:
+def iterate_parallel_batched_numpy(
+    xi: np.ndarray,
+    sigma_batch: np.ndarray,
+    n_steps: int,
+    clamp_layers=None,
+    mode: str = "cavity",
+) -> np.ndarray:
     """CPU fallback: (B,L,N) int8 -> (B,L,N) int8 after n_steps parallel steps."""
     from lam_engine import one_step_parallel
 
     clamp_layers = list(clamp_layers) if clamp_layers else None
-    out = np.empty_like(sigma_batch)
+    out = np.empty_like(sigma_batch, dtype=np.int8)
     for b in range(sigma_batch.shape[0]):
         s = sigma_batch[b].astype(np.int8)
         cue = s[clamp_layers].copy() if clamp_layers else None
         for _ in range(n_steps):
-            s = one_step_parallel(xi, s)
+            s = one_step_parallel(xi, s, mode=mode)
             if clamp_layers:
                 s[clamp_layers] = cue
         out[b] = s
     return out
 
 
-# ---------------------------------------------------------------------------
-# Unified entry point: dispatches to GPU or NumPy transparently
-# ---------------------------------------------------------------------------
-def iterate_parallel_auto(xi: np.ndarray, sigma_batch: np.ndarray, n_steps: int,
-                          clamp_layers=None, device: str = DEVICE,
-                          site_chunk: int = _DEFAULT_CHUNK) -> np.ndarray:
-    """Run the batched dynamics on device if torch+CUDA are available,
-    otherwise fall back to the pure-NumPy loop. Always returns a NumPy array.
-    """
-    if device == "cuda" and _HAS_TORCH and torch.cuda.is_available():
-        xi_t = to_xi_tensor(xi, device=device)
-        sig_t = torch.as_tensor(sigma_batch, dtype=torch.float32, device=device)
-        out_t = iterate_parallel_batched(xi_t, sig_t, n_steps, site_chunk=site_chunk,
-                                         clamp_layers=clamp_layers)
-        return out_t.cpu().numpy().astype(np.int8)
-    if _HAS_TORCH:
-        xi_t = to_xi_tensor(xi, device="cpu")
-        sig_t = torch.as_tensor(sigma_batch, dtype=torch.float32, device="cpu")
-        out_t = iterate_parallel_batched(xi_t, sig_t, n_steps, site_chunk=site_chunk,
-                                         clamp_layers=clamp_layers)
-        return out_t.cpu().numpy().astype(np.int8)
-    return iterate_parallel_batched_numpy(xi, sigma_batch, n_steps, clamp_layers=clamp_layers)
+def relax_parallel_batched_numpy(
+    xi: np.ndarray,
+    sigma_batch: np.ndarray,
+    max_steps: int = 20,
+    clamp_layers=None,
+    mode: str = "cavity",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """CPU fallback fixed-point relaxation matching relax_parallel_batched."""
+    from lam_engine import one_step_parallel
+
+    B = sigma_batch.shape[0]
+    clamp = list(clamp_layers) if clamp_layers else None
+    out = sigma_batch.copy().astype(np.int8)
+    steps = np.zeros(B, dtype=np.int32)
+    done = np.zeros(B, dtype=bool)
+    for b in range(B):
+        s = out[b]
+        cue = s[clamp].copy() if clamp else None
+        for t in range(1, max_steps + 1):
+            nxt = one_step_parallel(xi, s, mode=mode)
+            if clamp:
+                nxt[clamp] = cue
+            if np.array_equal(nxt, s):
+                done[b] = True
+                break
+            s = nxt
+            steps[b] = t
+        out[b] = s
+    return out, steps, done
 
 
-def cue_seed_auto(xi: np.ndarray, cue: np.ndarray, known_layers, device: str = DEVICE) -> np.ndarray:
-    """Dispatches cue_seed_batched (GPU) or cue_seed_numpy (CPU)."""
-    if device == "cuda" and _HAS_TORCH and torch.cuda.is_available():
-        xi_t = to_xi_tensor(xi, device=device)
-        cue_t = torch.as_tensor(cue, dtype=torch.float32, device=device)
-        return cue_seed_batched(xi_t, cue_t, known_layers).cpu().numpy().astype(np.int8)
-    if _HAS_TORCH:
-        xi_t = to_xi_tensor(xi, device="cpu")
-        cue_t = torch.as_tensor(cue, dtype=torch.float32, device="cpu")
+# ---------------------------------------------------------------------------
+# Unified entry points: dispatch to GPU or NumPy transparently
+# ---------------------------------------------------------------------------
+def iterate_parallel_auto(
+    xi: np.ndarray,
+    sigma_batch: np.ndarray,
+    n_steps: int,
+    clamp_layers=None,
+    device: str = DEVICE,
+    site_chunk: int = _DEFAULT_CHUNK,
+    mode: str = "cavity",
+) -> np.ndarray:
+    """Run batched dynamics on CUDA/CPU PyTorch if available, else pure NumPy."""
+    dev = _resolve_torch_device(device)
+    if dev is not None:
+        xi_t = to_xi_tensor(xi, device=dev)
+        sig_t = torch.as_tensor(sigma_batch, dtype=torch.float32, device=dev)
+        out_t = iterate_parallel_batched(
+            xi_t,
+            sig_t,
+            n_steps,
+            site_chunk=site_chunk,
+            clamp_layers=clamp_layers,
+            mode=mode,
+        )
+        return out_t.cpu().numpy().astype(np.int8)
+    return iterate_parallel_batched_numpy(
+        xi, sigma_batch, n_steps, clamp_layers=clamp_layers, mode=mode
+    )
+
+
+def relax_parallel_auto(
+    xi: np.ndarray,
+    sigma_batch: np.ndarray,
+    max_steps: int = 20,
+    clamp_layers=None,
+    device: str = DEVICE,
+    site_chunk: int = _DEFAULT_CHUNK,
+    mode: str = "cavity",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run fixed-point relaxation on CUDA/CPU PyTorch if available, else pure NumPy."""
+    dev = _resolve_torch_device(device)
+    if dev is not None:
+        xi_t = to_xi_tensor(xi, device=dev)
+        sig_t = torch.as_tensor(sigma_batch, dtype=torch.float32, device=dev)
+        out_t, steps_t, done_t = relax_parallel_batched(
+            xi_t,
+            sig_t,
+            max_steps=max_steps,
+            site_chunk=site_chunk,
+            clamp_layers=clamp_layers,
+            mode=mode,
+        )
+        return (
+            out_t.cpu().numpy().astype(np.int8),
+            steps_t.cpu().numpy().astype(np.int32),
+            done_t.cpu().numpy().astype(bool),
+        )
+    return relax_parallel_batched_numpy(
+        xi, sigma_batch, max_steps=max_steps, clamp_layers=clamp_layers, mode=mode
+    )
+
+
+def cue_seed_auto(
+    xi: np.ndarray, cue: np.ndarray, known_layers, device: str = DEVICE
+) -> np.ndarray:
+    """Dispatches cue_seed_batched (GPU/Torch) or cue_seed_numpy (CPU)."""
+    dev = _resolve_torch_device(device)
+    if dev is not None:
+        xi_t = to_xi_tensor(xi, device=dev)
+        cue_t = torch.as_tensor(cue, dtype=torch.float32, device=dev)
         return cue_seed_batched(xi_t, cue_t, known_layers).cpu().numpy().astype(np.int8)
     return cue_seed_numpy(xi, cue, known_layers)
 
@@ -217,7 +361,7 @@ if __name__ == "__main__":  # pragma: no cover
     from lam_engine import one_step_parallel
 
     rng = np.random.default_rng(0)
-    for (P, L, N) in [(20, 2, 32), (50, 2, 64), (30, 3, 48), (25, 4, 40)]:
+    for P, L, N in [(20, 2, 32), (50, 2, 64), (30, 3, 48), (25, 4, 40)]:
         xi = rng.choice(np.array([-1, 1], dtype=np.int8), size=(P, L, N))
         B = 7
         sig0 = rng.choice(np.array([-1, 1], dtype=np.int8), size=(B, L, N))
@@ -226,7 +370,12 @@ if __name__ == "__main__":  # pragma: no cover
         if _HAS_TORCH:
             xi_t = to_xi_tensor(xi, device="cpu")
             sig_t = torch.as_tensor(sig0, dtype=torch.float32)
-            got = one_step_parallel_batched(xi_t, sig_t, site_chunk=8).cpu().numpy().astype(np.int8)
+            got = (
+                one_step_parallel_batched(xi_t, sig_t, site_chunk=8)
+                .cpu()
+                .numpy()
+                .astype(np.int8)
+            )
             ok = np.array_equal(got, ref)
             print(f"[torch ] P={P} L={L} N={N}: match={ok}")
             assert ok, "GPU batched dynamics disagree with reference!"
